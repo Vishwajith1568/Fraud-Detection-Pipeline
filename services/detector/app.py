@@ -1,60 +1,150 @@
-import json
+"""
+app.py - Fraud Detection Pipeline Main Process
+Connects to Kafka, processes transactions, and produces fraud alerts.
+Detection logic lives in detection_engine.py for testability.
+"""
+
 import time
+import json
+import os
 from collections import defaultdict
-from kafka import KafkaConsumer
+from confluent_kafka import Consumer, Producer
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
 
-TOPIC_NAME = 'transactions'
-
-print(f"Connecting to Kafka broker to listen for '{TOPIC_NAME}'...")
-
-consumer = KafkaConsumer(
-    TOPIC_NAME,
-    bootstrap_servers=['localhost:29092'],
-    auto_offset_reset='latest',
-    enable_auto_commit=True,
-    group_id='fraud-detection-group',
-    value_deserializer=lambda x: json.loads(x.decode('utf-8'))
+from detection_engine import (
+    normalize_timestamp,
+    check_hard_rules,
+    check_ai_rules,
+    train_on_kaggle_dataset,
+    train_on_synthetic,
+    build_alert,
+    DEFAULT_CONFIG,
 )
 
-print("Consumer connected! Rule engine active...")
+TOPIC_NAME = 'transactions'
+KAGGLE_CSV_PATH = '/app/data/creditcard.csv'
 
-# Memory for our Velocity Rule: {user_id: [timestamp1, timestamp2]}
+# CLOUD ROUTE: Connects to Docker's Kafka using Confluent Syntax
+consumer = Consumer({
+    'bootstrap.servers': 'kafka:9092',
+    'group.id': 'fraud-ai-group',
+    'auto.offset.reset': 'earliest'
+})
+
+producer = Producer({
+    'bootstrap.servers': 'kafka:9092'
+})
+
+consumer.subscribe([TOPIC_NAME])
+
+print("=" * 60)
+print("  FRAUD DETECTION ENGINE v2.0")
+print("  Hard Rules + AI Anomaly Detection (Isolation Forest)")
+print("=" * 60)
+
 user_history = defaultdict(list)
-VELOCITY_TIME_WINDOW = 5.0  # seconds
-VELOCITY_MAX_TRANSACTIONS = 2  # More than 2 swipes in 5 seconds is fraud
+
+ai_model = IsolationForest(
+    n_estimators=DEFAULT_CONFIG['n_estimators'],
+    contamination=DEFAULT_CONFIG['contamination'],
+    random_state=DEFAULT_CONFIG['random_state']
+)
+scaler = StandardScaler()
+is_ai_trained = False
+kaggle_mode = False
+training_data = []
+
+
+def delivery_report(err, msg):
+    if err is not None:
+        print(f"Message delivery failed: {err}")
+    else:
+        print(f"FRAUD ALERT SENT to topic {msg.topic()}")
+
+
+# ── STARTUP: Train on Kaggle data if available ──
+if os.path.exists(KAGGLE_CSV_PATH):
+    print("\n" + "=" * 60)
+    print("  TRAINING ON KAGGLE CREDIT CARD FRAUD DATASET")
+    print("=" * 60)
+
+    result = train_on_kaggle_dataset(ai_model, scaler, KAGGLE_CSV_PATH)
+
+    if result['success']:
+        is_ai_trained = True
+        kaggle_mode = True
+        print(f"\n[1/5] Loaded {result['total_records']:,} transactions")
+        print(f"       Fraud cases: {result['fraud_count']} ({result['fraud_count']/result['total_records']*100:.3f}%)")
+        print(f"[2/5] Train: {result['train_size']:,} | Test: {result['test_size']:,}")
+        print(f"[3/5] Features scaled with StandardScaler")
+        print(f"[4/5] Training completed in {result['train_duration']:.2f} seconds")
+        print(f"\n  MODEL EVALUATION RESULTS")
+        print(f"  Precision: {result['precision']:.4f}")
+        print(f"  Recall:    {result['recall']:.4f}")
+        print(f"  F1 Score:  {result['f1']:.4f}")
+        print("\nAI Model trained on REAL DATA and ready for inference!")
+        print("=" * 60 + "\n")
+        print("Waiting for live transactions from Kafka...\n")
+    else:
+        print(f"[WARNING] {result.get('error', 'Unknown error')}")
+        print("Falling back to synthetic training...\n")
+else:
+    print("\n[INFO] Kaggle dataset not found. Will train on first 50 transactions.\n")
 
 try:
-    for message in consumer:
-        tx = message.value
-        user = tx.get('user_id')
-        amount = tx.get('amount')
-        merchant = tx.get('merchant_category')
-        
-        current_time = time.time()
-        
-        # --- RULE 1: HIGH AMOUNT ---
-        is_high_amount = amount > 2500
-        
-        # --- RULE 2: VELOCITY SPIKE (Sliding Window) ---
-        # First, clean up old memory (remove timestamps older than 5 seconds)
-        user_history[user] = [t for t in user_history[user] if current_time - t < VELOCITY_TIME_WINDOW]
-        
-        # Add the current transaction's timestamp
-        user_history[user].append(current_time)
-        
-        # Check if they exceeded the limit
-        is_velocity_spike = len(user_history[user]) > VELOCITY_MAX_TRANSACTIONS
-        
-        # --- DECISION ENGINE ---
-        if is_high_amount or is_velocity_spike:
-            reason = []
-            if is_high_amount: reason.append(f"HIGH AMOUNT (${amount})")
-            if is_velocity_spike: reason.append("VELOCITY SPIKE")
-            
-            print(f"🚨 FRAUD BLOCKED [{', '.join(reason)}] -> User: {user} | Merchant: {merchant}")
-        else:
-            print(f"✅ Approved -> User: {user} | Amount: ${amount}")
+    while True:
+        msg = consumer.poll(1.0)
+
+        if msg is None:
+            continue
+        if msg.error():
+            print(f"Consumer error: {msg.error()}")
+            continue
+
+        try:
+            transaction = json.loads(msg.value().decode('utf-8'))
+        except json.JSONDecodeError as e:
+            print(f"Skipping malformed message: {e}")
+            continue
+
+        transaction['_unix_timestamp'] = normalize_timestamp(transaction.get('timestamp'))
+
+        user_id = transaction.get('user_id', 'UNKNOWN')
+        amount = transaction.get('amount', 0)
+        tx_id = transaction.get('transaction_id', 'NO_ID')
+        print(f"Analyzing: {tx_id} | User: {user_id} | ${amount}")
+
+        # Fallback synthetic training
+        if not is_ai_trained:
+            unix_ts = transaction['_unix_timestamp']
+            training_data.append({
+                'amount': amount,
+                'time_of_day': (unix_ts % 86400) / 3600
+            })
+            if len(training_data) >= 50:
+                if train_on_synthetic(ai_model, scaler, training_data):
+                    is_ai_trained = True
+                    print("AI Model trained (synthetic) and active!\n")
+
+        fraud_reasons = check_hard_rules(transaction, user_history)
+        ai_reasons = check_ai_rules(transaction, ai_model, scaler, is_ai_trained, kaggle_mode)
+        all_reasons = fraud_reasons + ai_reasons
+
+        if all_reasons:
+            alert = build_alert(transaction, all_reasons)
+            print(f"FRAUD DETECTED: {all_reasons}")
+
+            producer.produce(
+                'fraud_alerts',
+                key=tx_id.encode('utf-8'),
+                value=json.dumps(alert).encode('utf-8'),
+                callback=delivery_report
+            )
+            producer.poll(0)
 
 except KeyboardInterrupt:
-    print("\nClosing consumer connection...")
+    print("Shutting down AI Detector...")
+finally:
     consumer.close()
+    producer.flush()

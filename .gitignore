@@ -1,5 +1,38 @@
+# Virtual environment
+.venv/
 venv/
+
+# Python
 __pycache__/
 *.pyc
-.env
+*.pyo
+*.egg-info/
+*.pkl
+
+# Node
 node_modules/
+
+# Docker volumes
+docker-data/
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Kaggle dataset (too large for GitHub - 150MB)
+services/detector/data/creditcard.csv
+
+# Coverage reports
+coverage.xml
+.coverage
+htmlcov/
+
+# Pytest cache
+.pytest_cache/
+
+# Environment files
+.env

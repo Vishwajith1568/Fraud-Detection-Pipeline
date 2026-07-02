@@ -28,6 +28,12 @@ services:
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
     volumes:
       - kafka-data:/var/lib/kafka/data
 
@@ -37,13 +43,76 @@ services:
     ports:
       - "8080:8080"
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
     environment:
       KAFKA_CLUSTERS_0_NAME: local-fraud-cluster
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
       KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
 
+  mongodb:
+    image: mongo:6.0
+    container_name: fraud-mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: fraud-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: fraud-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - prometheus
+
+  web-backend:
+    build: ./services/web-backend
+    container_name: fraud-web-backend
+    ports:
+      - "4000:4000"
+    environment:
+      - JWT_SECRET=my-super-secret-enterprise-key-2026
+    depends_on:
+      mongodb:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+
+  detector:
+    build: ./services/detector
+    container_name: fraud-detector
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  generator:
+    build: ./services/generator
+    container_name: fraud-generator
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  frontend-dashboard:
+    build: ./frontend-dashboard
+    container_name: fraud-frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - web-backend
+
 volumes:
   zookeeper-data:
   zookeeper-log:
   kafka-data:
+  mongodb_data:
