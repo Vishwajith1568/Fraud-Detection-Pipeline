@@ -1,9 +1,12 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import io from 'socket.io-client';
-import { ShieldAlert, Activity, CreditCard, Clock, Lock, TrendingUp, AlertTriangle, Users } from 'lucide-react';
 import {
-  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
-  BarChart, Bar, Cell, PieChart, Pie
+  ShieldAlert, Activity, Lock, TrendingUp, AlertTriangle,
+  Users, Radio, Zap, Globe, Server, ChevronRight, Eye, CheckCircle2
+} from 'lucide-react';
+import {
+  AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
+  BarChart, Bar, Cell
 } from 'recharts';
 import './App.css';
 
@@ -14,9 +17,28 @@ function App() {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [loginError, setLoginError] = useState('');
+  const [selectedAlert, setSelectedAlert] = useState(null);
+  const [clock, setClock] = useState(new Date());
+  const [reviewed, setReviewed] = useState(new Set());
+  const [escalatedCount, setEscalatedCount] = useState(0);
+  const [toast, setToast] = useState(null);
+  const feedRef = useRef(null);
+
+  // Live clock
+  useEffect(() => {
+    const t = setInterval(() => setClock(new Date()), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  // Auto-dismiss toast
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 2600);
+    return () => clearTimeout(t);
+  }, [toast]);
 
   const handleLogin = async (e) => {
-    e.preventDefault();
+    if (e) e.preventDefault();
     setLoginError('');
     try {
       const response = await fetch('http://localhost:4000/api/login', {
@@ -29,10 +51,10 @@ function App() {
         localStorage.setItem('token', data.token);
         setToken(data.token);
       } else {
-        setLoginError(data.message || 'Authentication Failed');
+        setLoginError(data.message || 'Authentication rejected');
       }
     } catch (err) {
-      setLoginError('Cannot connect to security backend');
+      setLoginError('Cannot reach authentication service');
     }
   };
 
@@ -40,6 +62,24 @@ function App() {
     localStorage.removeItem('token');
     setToken('');
     setAlerts([]);
+    setSelectedAlert(null);
+    setReviewed(new Set());
+    setEscalatedCount(0);
+  };
+
+  // Escalate: remove alert from feed, increment escalated counter, show toast
+  const handleEscalate = (alert) => {
+    setAlerts(prev => prev.filter(a => a.transaction_id !== alert.transaction_id));
+    setEscalatedCount(c => c + 1);
+    setSelectedAlert(null);
+    setToast({ type: 'escalate', msg: `Case escalated · ${alert.user_id}` });
+  };
+
+  // Mark reviewed: tag transaction as reviewed, keep in feed but dimmed
+  const handleReview = (alert) => {
+    setReviewed(prev => new Set(prev).add(alert.transaction_id));
+    setSelectedAlert(null);
+    setToast({ type: 'review', msg: `Marked reviewed · ${alert.user_id}` });
   };
 
   useEffect(() => {
@@ -57,17 +97,16 @@ function App() {
         const data = await response.json();
         setAlerts(Array.isArray(data) ? data : []);
       } catch (error) {
-        console.error("Error fetching historical alerts:", error);
+        console.error("Error fetching alerts:", error);
       }
     };
 
     fetchHistory();
-
     const socket = io('http://localhost:4000');
     socket.on('connect', () => setIsConnected(true));
     socket.on('disconnect', () => setIsConnected(false));
     socket.on('new_fraud_alert', (newAlert) => {
-      setAlerts((prevAlerts) => [newAlert, ...prevAlerts].slice(0, 100));
+      setAlerts((prev) => [newAlert, ...prev].slice(0, 100));
     });
 
     return () => {
@@ -80,330 +119,362 @@ function App() {
   }, [token]);
 
   const formatTime = (ts) => {
-    if (!ts) return "Unknown Time";
-    const dateObj = typeof ts === 'number' ? new Date(ts * 1000) : new Date(ts);
-    return dateObj.toLocaleTimeString();
+    if (!ts) return "--:--:--";
+    const d = typeof ts === 'number' ? new Date(ts * 1000) : new Date(ts);
+    return d.toLocaleTimeString('en-GB');
   };
 
-  // ── CHART DATA CALCULATIONS ──
+  const severityOf = (alert) => {
+    const n = (alert.reasons || []).length;
+    if (n >= 3) return 'critical';
+    if (n === 2) return 'high';
+    return 'medium';
+  };
 
-  // Alerts grouped by minute for the line chart
-  const timelineData = useMemo(() => {
-    if (alerts.length === 0) return [];
-
-    const minuteBuckets = {};
-    alerts.forEach(alert => {
-      if (!alert.timestamp) return;
-      const dateObj = typeof alert.timestamp === 'number'
-        ? new Date(alert.timestamp * 1000)
-        : new Date(alert.timestamp);
-      const minuteKey = dateObj.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-      minuteBuckets[minuteKey] = (minuteBuckets[minuteKey] || 0) + 1;
-    });
-
-    return Object.entries(minuteBuckets)
-      .map(([time, count]) => ({ time, count }))
-      .slice(-15); // last 15 minutes
-  }, [alerts]);
-
-  // Alerts grouped by reason type for the bar chart
-  const reasonData = useMemo(() => {
-    if (alerts.length === 0) return [];
-
-    const reasonCounts = {};
-    alerts.forEach(alert => {
-      (alert.reasons || []).forEach(reason => {
-        // Shorten reason labels for chart readability
-        let label = reason;
-        if (reason.includes('Velocity')) label = 'Velocity';
-        else if (reason.includes('International')) label = 'International';
-        else if (reason.includes('AI Anomaly')) label = 'AI Anomaly';
-        reasonCounts[label] = (reasonCounts[label] || 0) + 1;
-      });
-    });
-
-    return Object.entries(reasonCounts)
-      .map(([reason, count]) => ({ reason, count }))
-      .sort((a, b) => b.count - a.count);
-  }, [alerts]);
-
-  // Severity distribution for pie chart
-  const severityData = useMemo(() => {
-    if (alerts.length === 0) return [];
-
-    let high = 0, medium = 0, low = 0;
-    alerts.forEach(alert => {
-      const numReasons = (alert.reasons || []).length;
-      if (numReasons >= 3) high++;
-      else if (numReasons === 2) medium++;
-      else low++;
-    });
-
-    return [
-      { name: 'Critical', value: high, color: '#ef4444' },
-      { name: 'Warning', value: medium, color: '#f59e0b' },
-      { name: 'Low', value: low, color: '#3b82f6' },
-    ].filter(d => d.value > 0);
-  }, [alerts]);
-
-  // Summary stats
+  // DERIVED DATA
   const stats = useMemo(() => {
-    const totalAlerts = alerts.length;
-    const uniqueUsers = new Set(alerts.map(a => a.user_id)).size;
-
-    const aiCount = alerts.filter(a =>
-      (a.reasons || []).some(r => r.includes('AI Anomaly'))
-    ).length;
-
-    const avgAmount = totalAlerts > 0
-      ? (alerts.reduce((sum, a) => sum + (a.amount || 0), 0) / totalAlerts).toFixed(2)
-      : '0.00';
-
-    return { totalAlerts, uniqueUsers, aiCount, avgAmount };
+    const total = alerts.length;
+    const users = new Set(alerts.map(a => a.user_id)).size;
+    const ai = alerts.filter(a => (a.reasons || []).some(r => r.includes('AI'))).length;
+    const critical = alerts.filter(a => (a.reasons || []).length >= 3).length;
+    const volume = alerts.reduce((s, a) => s + (a.amount || 0), 0);
+    return { total, users, ai, critical, volume };
   }, [alerts]);
 
-  // Bar chart colors
-  const BAR_COLORS = ['#ef4444', '#f59e0b', '#3b82f6', '#10b981', '#8b5cf6'];
+  const timeline = useMemo(() => {
+    const buckets = {};
+    alerts.forEach(a => {
+      if (!a.timestamp) return;
+      const d = typeof a.timestamp === 'number' ? new Date(a.timestamp * 1000) : new Date(a.timestamp);
+      const k = d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+      buckets[k] = (buckets[k] || 0) + 1;
+    });
+    return Object.entries(buckets).map(([time, count]) => ({ time, count })).slice(-20);
+  }, [alerts]);
 
-  // Custom tooltip for charts
-  const CustomTooltip = ({ active, payload, label }) => {
-    if (active && payload && payload.length) {
-      return (
-        <div style={{
-          background: '#1e293b', border: '1px solid #334155', borderRadius: '8px',
-          padding: '10px 14px', color: '#f8fafc', fontSize: '0.85rem'
-        }}>
-          <p style={{ margin: 0, fontWeight: 600 }}>{label}</p>
-          <p style={{ margin: '4px 0 0', color: '#ef4444' }}>{payload[0].value} alerts</p>
-        </div>
-      );
-    }
-    return null;
-  };
+  const byType = useMemo(() => {
+    const c = {};
+    alerts.forEach(a => (a.reasons || []).forEach(r => {
+      let k = r.includes('Velocity') ? 'Velocity' : r.includes('International') ? 'Geo-Anomaly' : r.includes('AI') ? 'ML Model' : 'Other';
+      c[k] = (c[k] || 0) + 1;
+    }));
+    return Object.entries(c).map(([type, count]) => ({ type, count })).sort((a, b) => b.count - a.count);
+  }, [alerts]);
 
-  // ── LOGIN SCREEN ──
+  const barColor = (t) => ({ 'Velocity': '#f5a623', 'Geo-Anomaly': '#38bdf8', 'ML Model': '#a78bfa', 'Other': '#64748b' }[t] || '#64748b');
+
+  // LOGIN
   if (!token) {
     return (
-      <div className="login-wrapper" style={{
-        display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh', backgroundColor: '#0f172a'
-      }}>
-        <div style={{
-          background: '#1e293b', padding: '40px', borderRadius: '12px', width: '100%', maxWidth: '400px', boxShadow: '0 10px 25px -5px rgba(0,0,0,0.3)'
-        }}>
-          <div style={{ textAlign: 'center', marginBottom: '30px' }}>
-            <Lock size={48} color="#ef4444" style={{ marginBottom: '10px' }} />
-            <h2 style={{ color: '#f8fafc', margin: 0, fontSize: '1.5rem' }}>Security Command Login</h2>
-            <p style={{ color: '#94a3b8', fontSize: '0.875rem', marginTop: '5px' }}>Authorized Personnel Only</p>
-          </div>
-
-          {loginError && (
-            <div style={{ backgroundColor: 'rgba(239,68,68,0.1)', color: '#ef4444', padding: '10px', borderRadius: '6px', marginBottom: '20px', fontSize: '0.875rem', textAlign: 'center', border: '1px solid rgba(239,68,68,0.2)' }}>
-              {loginError}
+      <div className="auth-shell">
+        <div className="auth-grid-bg" />
+        <div className="auth-panel">
+          <div className="auth-brand">
+            <div className="auth-logo"><ShieldAlert size={20} /></div>
+            <div>
+              <div className="auth-brand-name">SENTINEL</div>
+              <div className="auth-brand-sub">Fraud Operations Console</div>
             </div>
-          )}
-
-          <div style={{ marginBottom: '20px' }}>
-            <label style={{ display: 'block', color: '#94a3b8', marginBottom: '8px', fontSize: '0.875rem' }}>Operator Username</label>
-            <input type="text" value={username} onChange={(e) => setUsername(e.target.value)} required style={{ width: '100%', padding: '10px', borderRadius: '6px', border: '1px solid #334155', backgroundColor: '#0f172a', color: '#f8fafc', boxSizing: 'border-box' }} />
           </div>
 
-          <div style={{ marginBottom: '30px' }}>
-            <label style={{ display: 'block', color: '#94a3b8', marginBottom: '8px', fontSize: '0.875rem' }}>Security Password</label>
-            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required style={{ width: '100%', padding: '10px', borderRadius: '6px', border: '1px solid #334155', backgroundColor: '#0f172a', color: '#f8fafc', boxSizing: 'border-box' }} />
+          <div className="auth-divider" />
+
+          <div className="auth-form">
+            <label className="field-label">Operator ID</label>
+            <input
+              className="field-input"
+              type="text"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && handleLogin()}
+              placeholder="analyst.id"
+              autoFocus
+            />
+
+            <label className="field-label">Access Key</label>
+            <input
+              className="field-input"
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && handleLogin()}
+              placeholder="********"
+            />
+
+            {loginError && <div className="auth-error"><AlertTriangle size={13} /> {loginError}</div>}
+
+            <button className="auth-submit" onClick={handleLogin}>
+              Authenticate <ChevronRight size={16} />
+            </button>
           </div>
 
-          <button type="button" onClick={handleLogin} style={{ width: '100%', padding: '12px', borderRadius: '6px', border: 'none', backgroundColor: '#ef4444', color: '#f8fafc', fontWeight: 'bold', cursor: 'pointer', fontSize: '1rem' }}>
-            Authenticate Session
-          </button>
+          <div className="auth-footer">
+            <span className="auth-status-dot" /> Secure channel &middot; TLS 1.3 &middot; Session-scoped
+          </div>
         </div>
       </div>
     );
   }
 
-  // ── DASHBOARD ──
+  // CONSOLE
   return (
-    <div className="dashboard-container">
-      <header className="header">
-        <div className="header-title">
-          <ShieldAlert size={32} color="#ff4d4f" />
-          <h1>Real-Time Fraud Command Center</h1>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '20px' }}>
-          <div className={`status-badge ${isConnected ? 'connected' : 'disconnected'}`}>
-            <Activity size={18} />
-            {isConnected ? 'System Online' : 'System Offline'}
+    <div className="console">
+      {/* Top Command Bar */}
+      <header className="cmd-bar">
+        <div className="cmd-left">
+          <div className="cmd-logo"><ShieldAlert size={18} /></div>
+          <div className="cmd-title">
+            <span className="cmd-name">SENTINEL</span>
+            <span className="cmd-tag">FRAUD OPS</span>
           </div>
-          <button onClick={handleLogout} style={{ background: 'none', border: '1px solid #475569', color: '#94a3b8', padding: '6px 12px', borderRadius: '6px', cursor: 'pointer', fontSize: '0.875rem' }}>
-            Disconnect
+        </div>
+
+        <div className="cmd-center">
+          <div className={`link-state ${isConnected ? 'up' : 'down'}`}>
+            <Radio size={13} />
+            <span>{isConnected ? 'STREAM LIVE' : 'STREAM DOWN'}</span>
+            <span className="pulse-dot" />
+          </div>
+        </div>
+
+        <div className="cmd-right">
+          <div className="cmd-clock">{clock.toLocaleTimeString('en-GB')} UTC</div>
+          <button className="cmd-logout" onClick={handleLogout}>
+            <Lock size={13} /> End Session
           </button>
         </div>
       </header>
 
-      <main className="main-content">
-
-        {/* ── SUMMARY STAT CARDS ── */}
-        <div className="stats-row">
-          <div className="stat-card">
-            <div className="stat-icon" style={{ backgroundColor: 'rgba(239,68,68,0.15)' }}>
-              <AlertTriangle size={22} color="#ef4444" />
-            </div>
-            <div className="stat-content">
-              <span className="stat-value">{stats.totalAlerts}</span>
-              <span className="stat-label">Total Alerts</span>
-            </div>
-          </div>
-
-          <div className="stat-card">
-            <div className="stat-icon" style={{ backgroundColor: 'rgba(59,130,246,0.15)' }}>
-              <Users size={22} color="#3b82f6" />
-            </div>
-            <div className="stat-content">
-              <span className="stat-value">{stats.uniqueUsers}</span>
-              <span className="stat-label">Flagged Users</span>
-            </div>
-          </div>
-
-          <div className="stat-card">
-            <div className="stat-icon" style={{ backgroundColor: 'rgba(139,92,246,0.15)' }}>
-              <TrendingUp size={22} color="#8b5cf6" />
-            </div>
-            <div className="stat-content">
-              <span className="stat-value">{stats.aiCount}</span>
-              <span className="stat-label">AI Detections</span>
-            </div>
-          </div>
-
-          <div className="stat-card">
-            <div className="stat-icon" style={{ backgroundColor: 'rgba(16,185,129,0.15)' }}>
-              <CreditCard size={22} color="#10b981" />
-            </div>
-            <div className="stat-content">
-              <span className="stat-value">${stats.avgAmount}</span>
-              <span className="stat-label">Avg Flagged Amount</span>
-            </div>
+      {/* Live Ticker */}
+      <div className="ticker">
+        <div className="ticker-label"><Zap size={12} /> LIVE</div>
+        <div className="ticker-track">
+          <div className="ticker-move">
+            {alerts.slice(0, 15).map((a, i) => (
+              <span key={i} className="ticker-item">
+                <span className={`tick-sev tick-${severityOf(a)}`} />
+                {a.user_id} &middot; {a.currency} {(a.amount || 0).toLocaleString()} &middot; {(a.reasons || [])[0]?.split(':')[0] || 'FLAG'}
+                <span className="ticker-sep">|</span>
+              </span>
+            ))}
+            {alerts.length === 0 && <span className="ticker-item ticker-idle">Awaiting telemetry stream from detection engine...</span>}
           </div>
         </div>
+      </div>
 
-        {/* ── CHARTS ROW ── */}
-        <div className="charts-row">
+      {/* Metric Strip */}
+      <div className="metric-strip">
+        <div className="metric">
+          <div className="metric-head"><AlertTriangle size={14} /> THREATS FLAGGED</div>
+          <div className="metric-val">{stats.total.toLocaleString()}</div>
+          <div className="metric-foot">rolling window</div>
+        </div>
+        <div className="metric metric-critical">
+          <div className="metric-head"><Zap size={14} /> CRITICAL</div>
+          <div className="metric-val">{stats.critical}</div>
+          <div className="metric-foot">3+ signals fired</div>
+        </div>
+        <div className="metric">
+          <div className="metric-head"><Users size={14} /> ACCOUNTS</div>
+          <div className="metric-val">{stats.users}</div>
+          <div className="metric-foot">unique flagged</div>
+        </div>
+        <div className="metric metric-escalated">
+          <div className="metric-head"><CheckCircle2 size={14} /> ESCALATED</div>
+          <div className="metric-val">{escalatedCount}</div>
+          <div className="metric-foot">cases actioned</div>
+        </div>
+        <div className="metric metric-wide">
+          <div className="metric-head"><Server size={14} /> EXPOSURE VOLUME</div>
+          <div className="metric-val metric-val-sm">${stats.volume.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>
+          <div className="metric-foot">sum of flagged transaction value</div>
+        </div>
+      </div>
 
-          {/* Line Chart: Alerts Over Time */}
-          <div className="chart-panel">
-            <h3 className="chart-title">Alerts Over Time</h3>
-            {timelineData.length > 0 ? (
-              <ResponsiveContainer width="100%" height={220}>
-                <LineChart data={timelineData}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                  <XAxis dataKey="time" stroke="#94a3b8" fontSize={11} tick={{ fill: '#94a3b8' }} />
-                  <YAxis stroke="#94a3b8" fontSize={11} tick={{ fill: '#94a3b8' }} allowDecimals={false} />
-                  <Tooltip content={<CustomTooltip />} />
-                  <Line type="monotone" dataKey="count" stroke="#ef4444" strokeWidth={2} dot={{ fill: '#ef4444', r: 4 }} activeDot={{ r: 6 }} />
-                </LineChart>
+      {/* Main Grid */}
+      <div className="grid">
+        {/* Left: Charts */}
+        <section className="panel panel-charts">
+          <div className="panel-head">
+            <span className="panel-title"><Activity size={14} /> DETECTION RATE</span>
+            <span className="panel-meta">alerts / minute</span>
+          </div>
+          <div className="chart-wrap">
+            {timeline.length > 0 ? (
+              <ResponsiveContainer width="100%" height={180}>
+                <AreaChart data={timeline} margin={{ top: 8, right: 8, left: -18, bottom: 0 }}>
+                  <defs>
+                    <linearGradient id="grad" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor="#38bdf8" stopOpacity={0.35} />
+                      <stop offset="100%" stopColor="#38bdf8" stopOpacity={0} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="2 4" stroke="#1e2b3d" vertical={false} />
+                  <XAxis dataKey="time" stroke="#3d4f66" fontSize={10} tickLine={false} axisLine={false} />
+                  <YAxis stroke="#3d4f66" fontSize={10} tickLine={false} axisLine={false} allowDecimals={false} />
+                  <Tooltip
+                    contentStyle={{ background: '#0d1725', border: '1px solid #1e2b3d', borderRadius: 4, fontSize: 12, fontFamily: 'IBM Plex Mono, monospace', color: '#e2e8f0' }}
+                    cursor={{ stroke: '#38bdf8', strokeWidth: 1, strokeDasharray: '3 3' }}
+                  />
+                  <Area type="monotone" dataKey="count" stroke="#38bdf8" strokeWidth={1.5} fill="url(#grad)" />
+                </AreaChart>
               </ResponsiveContainer>
-            ) : (
-              <div className="chart-empty">Collecting data...</div>
-            )}
+            ) : <div className="chart-idle">Collecting telemetry...</div>}
           </div>
 
-          {/* Bar Chart: Alerts by Reason */}
-          <div className="chart-panel">
-            <h3 className="chart-title">Alerts by Detection Type</h3>
-            {reasonData.length > 0 ? (
-              <ResponsiveContainer width="100%" height={220}>
-                <BarChart data={reasonData} layout="vertical">
-                  <CartesianGrid strokeDasharray="3 3" stroke="#334155" horizontal={false} />
-                  <XAxis type="number" stroke="#94a3b8" fontSize={11} tick={{ fill: '#94a3b8' }} allowDecimals={false} />
-                  <YAxis type="category" dataKey="reason" stroke="#94a3b8" fontSize={11} tick={{ fill: '#94a3b8' }} width={100} />
-                  <Tooltip content={<CustomTooltip />} />
-                  <Bar dataKey="count" radius={[0, 6, 6, 0]} barSize={24}>
-                    {reasonData.map((entry, index) => (
-                      <Cell key={`cell-${index}`} fill={BAR_COLORS[index % BAR_COLORS.length]} />
-                    ))}
+          <div className="panel-head panel-head-mid">
+            <span className="panel-title"><Eye size={14} /> SIGNAL BREAKDOWN</span>
+            <span className="panel-meta">by detector</span>
+          </div>
+          <div className="chart-wrap">
+            {byType.length > 0 ? (
+              <ResponsiveContainer width="100%" height={150}>
+                <BarChart data={byType} layout="vertical" margin={{ top: 4, right: 12, left: 8, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="2 4" stroke="#1e2b3d" horizontal={false} />
+                  <XAxis type="number" stroke="#3d4f66" fontSize={10} tickLine={false} axisLine={false} allowDecimals={false} />
+                  <YAxis type="category" dataKey="type" stroke="#7089a8" fontSize={11} width={82} tickLine={false} axisLine={false} />
+                  <Tooltip
+                    contentStyle={{ background: '#0d1725', border: '1px solid #1e2b3d', borderRadius: 4, fontSize: 12, fontFamily: 'IBM Plex Mono, monospace', color: '#e2e8f0' }}
+                    cursor={{ fill: 'rgba(56,189,248,0.05)' }}
+                  />
+                  <Bar dataKey="count" radius={[0, 2, 2, 0]} barSize={18}>
+                    {byType.map((e, i) => <Cell key={i} fill={barColor(e.type)} />)}
                   </Bar>
                 </BarChart>
               </ResponsiveContainer>
-            ) : (
-              <div className="chart-empty">Collecting data...</div>
-            )}
+            ) : <div className="chart-idle">No signals yet</div>}
           </div>
+        </section>
 
-          {/* Pie Chart: Severity Distribution */}
-          <div className="chart-panel chart-panel-small">
-            <h3 className="chart-title">Severity Breakdown</h3>
-            {severityData.length > 0 ? (
-              <ResponsiveContainer width="100%" height={220}>
-                <PieChart>
-                  <Pie
-                    data={severityData}
-                    cx="50%"
-                    cy="50%"
-                    innerRadius={50}
-                    outerRadius={80}
-                    dataKey="value"
-                    stroke="none"
+        {/* Center: Live Feed */}
+        <section className="panel panel-feed">
+          <div className="panel-head">
+            <span className="panel-title"><Radio size={14} /> LIVE THREAT FEED</span>
+            <span className="panel-meta">{alerts.length} active</span>
+          </div>
+          <div className="feed" ref={feedRef}>
+            {alerts.length === 0 ? (
+              <div className="feed-empty">
+                <Server size={28} strokeWidth={1.2} />
+                <p>Monitoring transaction stream</p>
+                <span>Flagged events will appear here in real time</span>
+              </div>
+            ) : (
+              alerts.map((a, i) => {
+                const sev = severityOf(a);
+                const isReviewed = reviewed.has(a.transaction_id);
+                return (
+                  <div
+                    key={a.transaction_id || i}
+                    className={`row row-${sev} ${selectedAlert?.transaction_id === a.transaction_id ? 'row-active' : ''} ${isReviewed ? 'row-reviewed' : ''}`}
+                    onClick={() => setSelectedAlert(a)}
                   >
-                    {severityData.map((entry, index) => (
-                      <Cell key={`pie-${index}`} fill={entry.color} />
-                    ))}
-                  </Pie>
-                  <Tooltip
-                    contentStyle={{ background: '#1e293b', border: '1px solid #334155', borderRadius: '8px', color: '#f8fafc', fontSize: '0.85rem' }}
-                  />
-                </PieChart>
-              </ResponsiveContainer>
-            ) : (
-              <div className="chart-empty">Collecting data...</div>
+                    <div className={`row-sev row-sev-${sev}`} />
+                    <div className="row-time">{formatTime(a.timestamp)}</div>
+                    <div className="row-user">{a.user_id}</div>
+                    <div className="row-amt">
+                      <span className="row-cur">{a.currency}</span>
+                      {(a.amount || 0).toLocaleString()}
+                    </div>
+                    <div className="row-tags">
+                      {isReviewed && <span className="row-tag row-tag-reviewed"><CheckCircle2 size={10} /> REVIEWED</span>}
+                      {(a.reasons || []).slice(0, 2).map((r, j) => (
+                        <span key={j} className="row-tag">{r.split(':')[0].replace('AI Anomaly Detected', 'ML').replace('International physical card transaction', 'GEO').replace('Velocity hit', 'VELOCITY')}</span>
+                      ))}
+                      {(a.reasons || []).length > 2 && <span className="row-tag row-tag-more">+{(a.reasons || []).length - 2}</span>}
+                    </div>
+                    <ChevronRight size={14} className="row-arrow" />
+                  </div>
+                );
+              })
             )}
-            <div className="pie-legend">
-              {severityData.map((d, i) => (
-                <div key={i} className="legend-item">
-                  <span className="legend-dot" style={{ backgroundColor: d.color }}></span>
-                  <span>{d.name}: {d.value}</span>
-                </div>
-              ))}
-            </div>
           </div>
-        </div>
+        </section>
 
-        {/* ── ALERT CARDS ── */}
-        <div className="alert-count">
-          <h2>Live Threat Feed ({alerts.length})</h2>
-        </div>
+        {/* Right: Inspector */}
+        <section className="panel panel-inspect">
+          <div className="panel-head">
+            <span className="panel-title"><Eye size={14} /> INSPECTOR</span>
+          </div>
+          {selectedAlert ? (
+            <div className="inspect">
+              <div className={`inspect-sev inspect-sev-${severityOf(selectedAlert)}`}>
+                {severityOf(selectedAlert).toUpperCase()} SEVERITY
+              </div>
 
-        <div className="alert-grid">
-          {alerts.length === 0 ? (
-            <div className="empty-state">Scan clean. Monitoring incoming Kafka telemetry data...</div>
-          ) : (
-            alerts.map((alert, index) => (
-              <div key={alert.transaction_id || index} className="alert-card slide-in">
-                <div className="card-header">
-                  <span className="user-id">{alert.user_id || 'UNKNOWN_USER'}</span>
-                  <span className="time"><Clock size={14}/> {formatTime(alert.timestamp)}</span>
+              <div className="inspect-block">
+                <div className="inspect-k">Transaction ID</div>
+                <div className="inspect-v inspect-mono">{selectedAlert.transaction_id}</div>
+              </div>
+              <div className="inspect-row">
+                <div className="inspect-block">
+                  <div className="inspect-k">Account</div>
+                  <div className="inspect-v">{selectedAlert.user_id}</div>
                 </div>
-                <div className="card-body">
-                  <div className="amount-section">
-                    <span className="currency">{alert.currency || 'USD'}</span>
-                    <span className="amount">{(alert.amount || 0).toLocaleString()}</span>
-                  </div>
-                  <div className="merchant-info">
-                    <CreditCard size={16} />
-                    <span>
-                      {(alert.merchant || alert.merchant_category || 'UNKNOWN_MERCHANT')
-                        .replace('_', ' ')
-                        .toUpperCase()}
-                    </span>
-                  </div>
-                </div>
-                <div className="card-footer">
-                  {(alert.reasons || []).map((reason, i) => (
-                    <span key={i} className="reason-tag">{reason}</span>
-                  ))}
+                <div className="inspect-block">
+                  <div className="inspect-k">Amount</div>
+                  <div className="inspect-v inspect-amt">{selectedAlert.currency} {(selectedAlert.amount || 0).toLocaleString()}</div>
                 </div>
               </div>
-            ))
+              <div className="inspect-row">
+                <div className="inspect-block">
+                  <div className="inspect-k">Merchant</div>
+                  <div className="inspect-v">{selectedAlert.merchant || selectedAlert.merchant_category || '-'}</div>
+                </div>
+                <div className="inspect-block">
+                  <div className="inspect-k">Timestamp</div>
+                  <div className="inspect-v inspect-mono">{formatTime(selectedAlert.timestamp)}</div>
+                </div>
+              </div>
+
+              <div className="inspect-divider" />
+
+              <div className="inspect-k inspect-k-wide">Triggered Signals</div>
+              <div className="inspect-signals">
+                {(selectedAlert.reasons || []).map((r, i) => (
+                  <div key={i} className="signal">
+                    <Zap size={12} />
+                    <span>{r}</span>
+                  </div>
+                ))}
+              </div>
+
+              {reviewed.has(selectedAlert.transaction_id) && (
+                <div className="inspect-reviewed-note">
+                  <CheckCircle2 size={13} /> This case has been marked reviewed
+                </div>
+              )}
+
+              <div className="inspect-actions">
+                <button className="act act-primary" onClick={() => handleEscalate(selectedAlert)}>Escalate Case</button>
+                <button className="act act-ghost" onClick={() => handleReview(selectedAlert)}>Mark Reviewed</button>
+              </div>
+            </div>
+          ) : (
+            <div className="inspect-empty">
+              <Eye size={26} strokeWidth={1.2} />
+              <p>Select a threat</p>
+              <span>Click any event in the feed to inspect its full signal chain</span>
+            </div>
           )}
+        </section>
+      </div>
+
+      {/* Status Footer */}
+      <footer className="status-bar">
+        <div className="status-seg"><span className="status-dot ok" /> DETECTION ENGINE</div>
+        <div className="status-seg"><span className="status-dot ok" /> KAFKA STREAM</div>
+        <div className="status-seg"><span className="status-dot ok" /> MONGO STORE</div>
+        <div className="status-seg status-push"><Globe size={12} /> Isolation Forest &middot; 284K training records &middot; hybrid rules active</div>
+      </footer>
+
+      {/* Toast Notification */}
+      {toast && (
+        <div className={`toast toast-${toast.type}`}>
+          <CheckCircle2 size={15} />
+          <span>{toast.msg}</span>
         </div>
-      </main>
+      )}
     </div>
   );
 }
